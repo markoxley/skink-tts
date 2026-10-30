@@ -1,0 +1,185 @@
+// File:    tts_proc.skink
+// Purpose: Subprocess TTS providers for skink-tts — offline engines run
+//          as child processes writing a WAV file which is read back.
+//          Covers espeak/espeak-ng (-w), piper (--output_file), and
+//          macOS say (-o, AIFF → returned raw since say lacks WAV).
+module tts_proc
+
+import "std/str"
+import "std/strconv"
+import "std/os"
+import "std/fs"
+import "std/rand"
+import "std/errors"
+import "std/libc"
+import "tts_iface"
+
+extern fn getpid() -> int
+
+// pcfg holds subprocess provider config behind Provider.State.
+struct pcfg {
+    bin:   string   // executable name or absolute path
+    style: int      // 0=espeak, 1=piper, 2=say
+    model: string   // piper: .onnx voice model path
+    extra: string   // additional CLI args, space-separated
+}
+
+var procBoxes map[int][]pcfg
+var procNext = 1
+
+const STYLE_ESPEAK = 0
+const STYLE_PIPER  = 1
+const STYLE_SAY    = 2
+
+// Espeak creates a provider for espeak/espeak-ng. Speed maps to the
+// -s wpm flag scaled around 160; Voice selects -v language/voice.
+pub fn Espeak() -> tts_iface.Provider {
+    return mkProc(espeakBin(), STYLE_ESPEAK, "", "")
+}
+
+// EspeakNG explicitly uses espeak-ng.
+pub fn EspeakNG() -> tts_iface.Provider {
+    return mkProc("espeak-ng", STYLE_ESPEAK, "", "")
+}
+
+// Piper creates a provider for piper TTS. model is the path to an
+// .onnx voice (e.g. /usr/share/piper/en_US-amy-medium.onnx).
+pub fn Piper(model: string) -> tts_iface.Provider {
+    return mkProc("piper", STYLE_PIPER, model, "")
+}
+
+// Say creates a provider for macOS `say`. Output is AIFF — Opts.Format
+// is ignored.
+pub fn Say() -> tts_iface.Provider {
+    return mkProc("say", STYLE_SAY, "", "")
+}
+
+// Available reports whether the named engine binary exists on PATH.
+pub fn Available(bin: string) -> bool {
+    out, _ := os.RunWithOutput(str.Concat("command -v ", shellEsc(bin)))
+    return str.Len(str.Trim(out)) > 0
+}
+
+// DetectProc returns a provider for the first installed offline
+// engine (espeak-ng → espeak → piper needs model → say), or an
+// error-carrying provider named "none".
+pub fn DetectProc() -> tts_iface.Provider {
+    if Available("espeak-ng") {
+        return EspeakNG()
+    }
+    if Available("espeak") {
+        return mkProc("espeak", STYLE_ESPEAK, "", "")
+    }
+    if Available("say") {
+        return Say()
+    }
+    return tts_iface.New("none")
+}
+
+// espeakBin picks espeak-ng when present, else espeak.
+fn espeakBin() -> string {
+    if Available("espeak-ng") {
+        return "espeak-ng"
+    }
+    return "espeak"
+}
+
+// mkProc boxes a pcfg and builds the Provider.
+fn mkProc(bin: string, style: int, model: string, extra: string) -> tts_iface.Provider {
+    if procBoxes == nil {
+        procBoxes = make(map[int][]pcfg)
+    }
+    s := make([]pcfg, 1)
+    s[0] = pcfg{bin: bin, style: style, model: model, extra: extra}
+    h := procNext
+    procNext = procNext + 1
+    procBoxes[h] = s
+    p := tts_iface.New(bin)
+    p.State = int64(h)
+    p.speakFn = procSpeak
+    return p
+}
+
+// shellEsc wraps a string in single quotes, escaping embedded ones.
+fn shellEsc(s: string) -> string {
+    out := "'"
+    n := str.Len(s)
+    for i := 0; i < n; i = i + 1 {
+        c := s[i]
+        if c == 39 {          // single quote
+            out = str.Concat(out, "'\\''")
+        } else {
+            out = str.Concat(out, str.Substr(s, i, 1))
+        }
+    }
+    return str.Concat(out, "'")
+}
+
+// procSpeak runs the engine to a temp output file and returns its bytes.
+fn procSpeak(p: *tts_iface.Provider, text: string, o: tts_iface.Opts) -> (string, int, errors.Error) {
+    c := &procBoxes[int(p.State)][0]
+    ext := "wav"
+    if c.style == STYLE_SAY {
+        ext = "aiff"
+    }
+    // Randomized name: a predictable /tmp path lets a pre-created
+    // symlink redirect the engine's output file.
+    outPath := str.Concat("/tmp/skink-tts-", str.Concat(strconv.Itoa(getpid()),
+        str.Concat("-", str.Concat(strconv.Itoa(rand.Int()), str.Concat(".", ext)))))
+
+    cmd := c.bin
+    if c.style == STYLE_ESPEAK {
+        wpm := int(160.0 * o.Speed)
+        cmd = str.Concat(cmd, str.Concat(" -w ", shellEsc(outPath)))
+        if str.Len(o.Voice) > 0 {
+            cmd = str.Concat(cmd, str.Concat(" -v ", shellEsc(o.Voice)))
+        }
+        cmd = str.Concat(cmd, str.Concat(" -s ", strconv.Itoa(wpm)))
+        cmd = str.Concat(cmd, str.Concat(" ", shellEsc(text)))
+    } else if c.style == STYLE_PIPER {
+        if str.Len(c.model) == 0 {
+            return "", 0, errors.New("tts: piper provider requires a model path")
+        }
+        cmd = str.Concat(cmd, str.Concat(" --model ", shellEsc(c.model)))
+        cmd = str.Concat(cmd, str.Concat(" --output_file ", shellEsc(outPath)))
+        // piper reads text on stdin
+        cmd = str.Concat("echo ", str.Concat(shellEsc(text), str.Concat(" | ", cmd)))
+    } else {
+        // say
+        cmd = str.Concat(cmd, str.Concat(" -o ", shellEsc(outPath)))
+        if str.Len(o.Voice) > 0 {
+            cmd = str.Concat(cmd, str.Concat(" -v ", shellEsc(o.Voice)))
+        }
+        cmd = str.Concat(cmd, str.Concat(" ", shellEsc(text)))
+    }
+    if str.Len(c.extra) > 0 {
+        cmd = str.Concat(cmd, str.Concat(" ", c.extra))
+    }
+
+    code := os.System(cmd)
+    if code != 0 {
+        return "", 0, errors.New(str.Concat("tts: ", str.Concat(c.bin, " exited nonzero")))
+    }
+    if !fs.Exists(outPath) {
+        return "", 0, errors.New(str.Concat("tts: ", str.Concat(c.bin, " produced no output")))
+    }
+    size := int(fs.FileSize(outPath))
+    f, ferr := fs.Open(outPath, "rb")
+    if str.Len(ferr.message) > 0 {
+        fs.Remove(outPath)
+        return "", 0, ferr
+    }
+    data := libc.malloc(size + 1)
+    got := 0
+    for got < size {
+        n := f.Read(string(int64(data) + int64(got)), size - got)
+        if n <= 0 {
+            break
+        }
+        got = got + n
+    }
+    f.Close()
+    fs.Remove(outPath)
+    data[got] = 0
+    return data, got, errors.New("")
+}

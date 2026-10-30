@@ -1,0 +1,215 @@
+// File:    tts_http.skink
+// Purpose: Minimal binary-safe HTTP(S) client for skink-tts. Unlike
+//          std/api this keeps explicit byte lengths end-to-end so WAV
+//          audio payloads (which contain NULs) survive; supports
+//          custom headers (Authorization) and reports real status
+//          codes. TLS goes through the runtime's Skink_tls_* helpers.
+module tts_http
+
+import "std/str"
+import "std/strconv"
+import "std/net"
+import "std/errors"
+import "std/libc"
+
+extern fn Skink_tls_client_connect_ex(fd: int, hostname: string, port: int, verify: int) -> int64
+extern fn Skink_tls_read(ssl: int64, buf: string, len: int) -> int
+extern fn Skink_tls_write(ssl: int64, buf: string, len: int) -> int
+extern fn Skink_tls_close(ssl: int64)
+extern fn Skink_set_socket_timeout(fd: int, timeoutMs: int) -> int
+
+const maxRespBytes = 67108864
+
+// Resp is a parsed HTTP response. Body is malloc'd — caller frees.
+pub struct Resp {
+    Status:  int
+    Body:    string
+    BodyLen: int
+}
+
+// Post sends `body` (explicit byteLen — binary-safe) as an HTTP POST.
+// headers is raw "Name: value" lines separated by \r\n (may be "").
+// Returns the status and a malloc'd body; BodyLen is always correct.
+pub fn Post(url: string, contentType: string, headers: string, body: string, bodyLen: int) -> (Resp, errors.Error) {
+    var empty Resp
+    host, path, port, tls := parseURL(url)
+    if !clean(host) || !clean(path) || !clean(contentType) {
+        return empty, errors.New("invalid characters in request")
+    }
+    conn, cerr := net.Connect(host, port)
+    if str.Len(cerr.message) > 0 {
+        return empty, cerr
+    }
+    Skink_set_socket_timeout(conn.fd, 30000)
+
+    // Build the head as text, then append the possibly-binary body.
+    head := "POST "
+    head = str.Concat(head, path)
+    head = str.Concat(head, " HTTP/1.1\r\nHost: ")
+    head = str.Concat(head, host)
+    head = str.Concat(head, "\r\nContent-Type: ")
+    head = str.Concat(head, contentType)
+    head = str.Concat(head, "\r\nContent-Length: ")
+    head = str.Concat(head, strconv.Itoa(bodyLen))
+    head = str.Concat(head, "\r\n")
+    if str.Len(headers) > 0 {
+        head = str.Concat(head, headers)
+        if !str.EndsWith(head, "\r\n") {
+            head = str.Concat(head, "\r\n")
+        }
+    }
+    head = str.Concat(head, "Connection: close\r\n\r\n")
+
+    headLen := str.Len(head)
+    req := libc.malloc(headLen + bodyLen)
+    libc.memcpy(req, head, headLen)
+    if bodyLen > 0 {
+        libc.memcpy(string(int64(req) + int64(headLen)), body, bodyLen)
+    }
+
+    ssl := int64(0)
+    werr := errors.New("")
+    if tls {
+        sv := Skink_tls_client_connect_ex(conn.fd, host, port, 1)
+        if sv == 0 {
+            conn.Close()
+            libc.free(req)
+            return empty, errors.New("TLS handshake failed")
+        }
+        ssl = sv
+        sent := 0
+        total := headLen + bodyLen
+        for sent < total {
+            n := Skink_tls_write(ssl, string(int64(req) + int64(sent)), total - sent)
+            if n <= 0 {
+                werr = errors.New("TLS write failed")
+                break
+            }
+            sent = sent + n
+        }
+    } else {
+        n := conn.SendAll(req, headLen + bodyLen)
+        if n < headLen + bodyLen {
+            werr = errors.New("write failed")
+        }
+    }
+    libc.free(req)
+    if str.Len(werr.message) > 0 {
+        if ssl != 0 {
+            Skink_tls_close(ssl)
+        }
+        conn.Close()
+        return empty, werr
+    }
+
+    // Read the full response.
+    bufSize := 8192
+    buf := libc.malloc(bufSize)
+    total := 0
+    for {
+        if total >= bufSize - 1 {
+            if bufSize >= maxRespBytes {
+                break
+            }
+            nb := libc.realloc(buf, bufSize * 2)
+            if int64(nb) == 0 {
+                break
+            }
+            buf = nb
+            bufSize = bufSize * 2
+        }
+        var n int
+        if ssl != 0 {
+            n = Skink_tls_read(ssl, string(int64(buf) + int64(total)), bufSize - total - 1)
+        } else {
+            n = conn.Read(string(int64(buf) + int64(total)), bufSize - total - 1)
+        }
+        if n <= 0 {
+            break
+        }
+        total = total + n
+    }
+    if ssl != 0 {
+        Skink_tls_close(ssl)
+    }
+    conn.Close()
+    if total == 0 {
+        libc.free(buf)
+        return empty, errors.New("empty response")
+    }
+
+    // Parse status line "HTTP/1.x NNN" and split at \r\n\r\n.
+    status := 0
+    i := 0
+    for i < total && buf[i] != 32 {
+        i = i + 1
+    }
+    if i < total {
+        j := i + 1
+        st := 0
+        for j < total && buf[j] >= 48 && buf[j] <= 57 {
+            st = st * 10 + int(buf[j]) - 48
+            j = j + 1
+        }
+        status = st
+    }
+    hdrEnd := -1
+    for k := 0; k + 3 < total; k = k + 1 {
+        if buf[k] == 13 && buf[k + 1] == 10 && buf[k + 2] == 13 && buf[k + 3] == 10 {
+            hdrEnd = k + 4
+            break
+        }
+    }
+    if hdrEnd < 0 {
+        libc.free(buf)
+        return empty, errors.New("malformed response")
+    }
+    bodyLen2 := total - hdrEnd
+    bdy := libc.malloc(bodyLen2 + 1)
+    libc.memcpy(bdy, string(int64(buf) + int64(hdrEnd)), bodyLen2)
+    bdy[bodyLen2] = 0
+    libc.free(buf)
+    return Resp{Status: status, Body: bdy, BodyLen: bodyLen2}, errors.New("")
+}
+
+// parseURL splits a URL into (host, path, port, useTLS).
+fn parseURL(url: string) -> (string, string, int, bool) {
+    rest := url
+    tls := false
+    port := 80
+    if str.StartsWith(url, "http://") {
+        rest = str.Substr(url, 7, str.Len(url) - 7)
+    } else if str.StartsWith(url, "https://") {
+        rest = str.Substr(url, 8, str.Len(url) - 8)
+        tls = true
+        port = 443
+    }
+    pathStart := str.IndexOf(rest, "/")
+    host := rest
+    path := "/"
+    if pathStart >= 0 {
+        host = str.Substr(rest, 0, pathStart)
+        path = str.Substr(rest, pathStart, str.Len(rest) - pathStart)
+    }
+    colon := str.IndexOf(host, ":")
+    if colon >= 0 {
+        p, ok := strconv.ParseInt(str.Substr(host, colon + 1, str.Len(host) - colon - 1))
+        host = str.Substr(host, 0, colon)
+        if ok {
+            port = p
+        }
+    }
+    return host, path, port, tls
+}
+
+// clean reports whether s is safe inside a request line/header.
+fn clean(s: string) -> bool {
+    n := int(libc.strlen(s))
+    for i := 0; i < n; i = i + 1 {
+        c := int(s[i])
+        if c == 13 || c == 10 {
+            return false
+        }
+    }
+    return true
+}

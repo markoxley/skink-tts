@@ -1,0 +1,113 @@
+// File:    tts_rest.skink
+// Purpose: OpenAI-compatible REST TTS provider for skink-tts. POSTs
+//          {model, input, voice, speed, response_format} JSON to
+//          /v1/audio/speech with a Bearer token; works with OpenAI and
+//          compatible self-hosted endpoints (e.g. LocalAI, OpenRouter,
+//          sherpa-onnx's server) via a configurable base URL.
+module tts_rest
+
+import "std/str"
+import "std/strconv"
+import "std/errors"
+import "std/libc"
+import "tts_iface"
+import "tts_http"
+
+// cfg holds provider config; boxes hold them behind Provider.State
+// because Skink can't cast int64 back to a struct pointer — a len-1
+// slice gives a stable heap address, the map key is the handle.
+struct cfg {
+    base:  string  // e.g. "https://api.openai.com"
+    key:   string  // API token; "" = no Authorization header
+    model: string  // e.g. "tts-1"
+}
+
+var cfgBoxes map[int][]cfg
+var cfgNext = 1
+
+// OpenAI creates a provider for api.openai.com. model is e.g. "tts-1"
+// or "tts-1-hd"; typical voices: alloy, echo, fable, onyx, nova, shimmer.
+pub fn OpenAI(apiKey: string, model: string) -> tts_iface.Provider {
+    return WithBase("https://api.openai.com", apiKey, model)
+}
+
+// WithBase creates a provider against any OpenAI-compatible endpoint.
+pub fn WithBase(base: string, apiKey: string, model: string) -> tts_iface.Provider {
+    if cfgBoxes == nil {
+        cfgBoxes = make(map[int][]cfg)
+    }
+    s := make([]cfg, 1)
+    s[0] = cfg{base: base, key: apiKey, model: model}
+    h := cfgNext
+    cfgNext = cfgNext + 1
+    cfgBoxes[h] = s
+    p := tts_iface.New("rest")
+    p.State = int64(h)
+    p.speakFn = doSpeak
+    return p
+}
+
+// cfgOf recovers the cfg behind a provider's State handle.
+fn cfgOf(p: *tts_iface.Provider) -> *cfg {
+    return &cfgBoxes[int(p.State)][0]
+}
+
+// doSpeak is the Provider vtable implementation.
+fn doSpeak(p: *tts_iface.Provider, text: string, o: tts_iface.Opts) -> (string, int, errors.Error) {
+    cc := cfgOf(p)
+
+    // Build JSON {"model":...,"input":...,"voice":...,"speed":...,"response_format":...}
+    body := "{\"model\":\""
+    body = str.Concat(body, jsonEsc(cc.model))
+    body = str.Concat(body, "\",\"input\":\"")
+    body = str.Concat(body, jsonEsc(text))
+    body = str.Concat(body, "\",\"voice\":\"")
+    body = str.Concat(body, jsonEsc(o.Voice))
+    body = str.Concat(body, "\",\"speed\":")
+    body = str.Concat(body, strconv.FormatFloat(o.Speed, 2))
+    body = str.Concat(body, ",\"response_format\":\"")
+    fmt := o.Format
+    if str.Len(fmt) == 0 {
+        fmt = "wav"
+    }
+    body = str.Concat(body, jsonEsc(fmt))
+    body = str.Concat(body, "\"}")
+
+    headers := ""
+    if str.Len(cc.key) > 0 {
+        headers = str.Concat("Authorization: Bearer ", cc.key)
+    }
+    url := str.Concat(cc.base, "/v1/audio/speech")
+    resp, err := tts_http.Post(url, "application/json", headers, body, str.Len(body))
+    if str.Len(err.message) > 0 {
+        return "", 0, err
+    }
+    if resp.Status < 200 || resp.Status >= 300 {
+        libc.free(resp.Body)
+        return "", 0, errors.New(str.Concat("tts: HTTP ", strconv.Itoa(resp.Status)))
+    }
+    return resp.Body, resp.BodyLen, errors.New("")
+}
+
+// jsonEsc escapes a string for embedding inside JSON quotes.
+fn jsonEsc(s: string) -> string {
+    out := ""
+    n := str.Len(s)
+    for i := 0; i < n; i = i + 1 {
+        c := int(s[i])
+        if c == 34 {          // "
+            out = str.Concat(out, "\\\"")
+        } else if c == 92 {   // backslash
+            out = str.Concat(out, "\\\\")
+        } else if c == 10 {
+            out = str.Concat(out, "\\n")
+        } else if c == 13 {
+            out = str.Concat(out, "\\r")
+        } else if c == 9 {
+            out = str.Concat(out, "\\t")
+        } else {
+            out = str.Concat(out, str.Substr(s, i, 1))
+        }
+    }
+    return out
+}

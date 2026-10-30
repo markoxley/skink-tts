@@ -1,0 +1,120 @@
+// File:    live_test.skink
+// Purpose: Live TTS test — real offline engines when installed, real
+//          OpenAI when TTS_API_KEY/OPENAI_API_KEY is set. Self-skips
+//          when nothing is available. Validates returned bytes start
+//          with a known audio magic (RIFF for WAV, FORM for AIFF).
+module main
+
+import "tts_iface"
+import "tts_proc"
+import "tts_rest"
+import "std/str"
+import "std/os"
+import "std/libc"
+
+fn checkMagic(data: string, n: int, name: string) -> int {
+    if n < 12 {
+        println("FAIL: ", name, " returned only ", n, " bytes")
+        return 1
+    }
+    riff := data[0] == 82 && data[1] == 73 && data[2] == 70 && data[3] == 70
+    form := data[0] == 70 && data[1] == 79 && data[2] == 82 && data[3] == 77
+    ogg := data[0] == 79 && data[1] == 103 && data[2] == 103 && data[3] == 83
+    if !riff && !form && !ogg {
+        println("FAIL: ", name, " returned unrecognized audio magic")
+        return 1
+    }
+    println("OK: ", name, " produced ", n, " bytes of audio")
+    return 0
+}
+
+fn main() -> int {
+    fails := 0
+    ran := 0
+
+    // Offline engines — whatever happens to be installed.
+    if tts_proc.Available("espeak") || tts_proc.Available("espeak-ng") {
+        ran = ran + 1
+        p := tts_proc.Espeak()
+        data, n, err := p.Speak("hello from skink", tts_iface.DefaultOpts())
+        if str.Len(err.message) > 0 {
+            println("FAIL: espeak: ", err.message)
+            fails = fails + 1
+        } else {
+            fails = fails + checkMagic(data, n, "espeak")
+        }
+        if n > 0 {
+            libc.free(data)
+        }
+    }
+
+    if tts_proc.Available("say") {
+        ran = ran + 1
+        p := tts_proc.Say()
+        data, n, err := p.Speak("hello from skink", tts_iface.DefaultOpts())
+        if str.Len(err.message) > 0 {
+            println("FAIL: say: ", err.message)
+            fails = fails + 1
+        } else {
+            fails = fails + checkMagic(data, n, "say")
+        }
+        if n > 0 {
+            libc.free(data)
+        }
+    }
+
+    piperModel := os.Getenv("TTS_PIPER_MODEL")
+    if str.Len(piperModel) > 0 && tts_proc.Available("piper") {
+        ran = ran + 1
+        p := tts_proc.Piper(piperModel)
+        data, n, err := p.Speak("hello from skink", tts_iface.DefaultOpts())
+        if str.Len(err.message) > 0 {
+            println("FAIL: piper: ", err.message)
+            fails = fails + 1
+        } else {
+            fails = fails + checkMagic(data, n, "piper")
+        }
+        if n > 0 {
+            libc.free(data)
+        }
+    }
+
+    // OpenAI-compatible REST — opt-in via env.
+    key := os.Getenv("TTS_API_KEY")
+    if str.Len(key) == 0 {
+        key = os.Getenv("OPENAI_API_KEY")
+    }
+    if str.Len(key) > 0 {
+        ran = ran + 1
+        base := os.Getenv("TTS_BASE_URL")
+        var p tts_iface.Provider
+        if str.Len(base) > 0 {
+            p = tts_rest.WithBase(base, key, "tts-1")
+        } else {
+            p = tts_rest.OpenAI(key, "tts-1")
+        }
+        o := tts_iface.DefaultOpts()
+        o.Voice = "alloy"
+        data, n, err := p.Speak("hello from skink", o)
+        if str.Len(err.message) > 0 {
+            println("FAIL: rest: ", err.message)
+            fails = fails + 1
+        } else {
+            fails = fails + checkMagic(data, n, "rest")
+        }
+        if n > 0 {
+            libc.free(data)
+        }
+    }
+
+    if ran == 0 {
+        println("SKIP: no TTS engine available (install espeak or set TTS_API_KEY)")
+        return 0
+    }
+    if fails > 0 {
+        println("FAILED: ", fails, " provider(s)")
+        return 1
+    }
+    println("PASS: tts live test (", ran, " provider(s))")
+    return 0
+}

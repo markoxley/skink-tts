@@ -1,0 +1,67 @@
+// File:    tts.skink
+// Purpose: Root module for skink-tts. Re-exports the provider
+//          interface plus the REST (OpenAI-compatible) and subprocess
+//          (espeak/piper/say) providers so `import "tts"` is the
+//          common entry point.
+//
+//          Layers:
+//            tts_iface — Provider vtable + Opts (backend-agnostic)
+//            tts_http  — binary-safe HTTP(S) POST client
+//            tts_rest  — OpenAI-compatible REST provider
+//            tts_proc  — espeak/espeak-ng/piper/say subprocess providers
+module tts
+
+import "tts_iface"
+import "tts_http"
+import "tts_rest"
+import "tts_proc"
+
+// NewOpenAI creates a provider for api.openai.com.
+pub fn NewOpenAI(apiKey: string, model: string) -> tts_iface.Provider {
+    return tts_rest.OpenAI(apiKey, model)
+}
+
+// NewEspeak creates an espeak/espeak-ng subprocess provider.
+pub fn NewEspeak() -> tts_iface.Provider {
+    return tts_proc.Espeak()
+}
+
+// NewPiper creates a piper provider for the given .onnx model path.
+pub fn NewPiper(model: string) -> tts_iface.Provider {
+    return tts_proc.Piper(model)
+}
+
+// NewSay creates a macOS `say` provider.
+pub fn NewSay() -> tts_iface.Provider {
+    return tts_proc.Say()
+}
+
+// Detect returns the first usable provider: any offline engine on
+// PATH, else an OpenAI provider when TTS_API_KEY (or OPENAI_API_KEY)
+// is set. Name "none" means nothing was found.
+pub fn Detect() -> tts_iface.Provider {
+    p := tts_proc.DetectProc()
+    if p.Name != "none" {
+        return p
+    }
+    k := getKey()
+    if str.Len(k) > 0 {
+        return OpenAI(k, "tts-1")
+    }
+    return p
+}
+
+// Speak synthesizes text through a provider with default options.
+pub fn Speak(p: *tts_iface.Provider, text: string) -> (string, int, string) {
+    bytes, n, err := p.Speak(text, tts_iface.DefaultOpts())
+    return bytes, n, err.message
+}
+
+// getKey reads TTS_API_KEY, falling back to OPENAI_API_KEY.
+fn getKey() -> string {
+    k := os.Getenv("TTS_API_KEY")
+    if str.Len(k) == 0 {
+        k = os.Getenv("OPENAI_API_KEY")
+    }
+    return k
+}

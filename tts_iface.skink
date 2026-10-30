@@ -1,0 +1,52 @@
+// File:    tts_iface.skink
+// Purpose: Provider abstraction for skink-tts. Skink has no interfaces,
+//          so a Provider is a function-valued struct — each backend
+//          (REST, subprocess, custom) fills SpeakFn + State and callers
+//          dispatch uniformly via Speak. Speak returns audio bytes in
+//          the provider's native format (WAV unless noted).
+module tts_iface
+
+import "std/errors"
+
+// Opts controls synthesis. Empty fields take provider defaults.
+pub struct Opts {
+    Voice:  string  // e.g. "alloy", "en_US-amy-medium"
+    Speed:  float   // 1.0 = normal (REST); espeak wpm scale (proc)
+    Lang:   string  // e.g. "en", "en-US"
+    Format: string  // "wav" default; providers may support "mp3","pcm"
+}
+
+// Provider is a TTS backend: fn vtable + opaque state.
+pub struct Provider {
+    Name:  string
+    State: int64   // opaque backend handle
+
+    // speakFn returns (audioBytes, byteLen, err). audioBytes is
+    // malloc'd — the caller frees it.
+    speakFn: fn(*Provider, string, Opts) -> (string, int, errors.Error)
+
+    // Speak synthesizes text into audio bytes. An uninitialized
+    // provider returns an error via errNoSpeak.
+    pub fn Speak(self: *Provider, text: string, o: Opts) -> (string, int, errors.Error) {
+        return self.speakFn(self, text, o)
+    }
+}
+
+// errNoSpeak is the vtable entry for uninitialized providers.
+fn errNoSpeak(p: *Provider, text: string, o: Opts) -> (string, int, errors.Error) {
+    return "", 0, errors.New("tts: provider has no speak function")
+}
+
+// New returns a Provider wired to errNoSpeak — call sites that forget
+// to install speakFn get a clean error instead of a null jump.
+pub fn New(name: string) -> Provider {
+    var p Provider
+    p.Name = name
+    p.speakFn = errNoSpeak
+    return p
+}
+
+// DefaultOpts returns sensible defaults (wav, normal speed).
+pub fn DefaultOpts() -> Opts {
+    return Opts{Voice: "", Speed: 1.0, Lang: "", Format: "wav"}
+}
