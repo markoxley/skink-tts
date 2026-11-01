@@ -18,6 +18,12 @@ extern fn Skink_tls_write(ssl: int64, buf: string, len: int) -> int
 extern fn Skink_tls_close(ssl: int64)
 extern fn Skink_set_socket_timeout(fd: int, timeoutMs: int) -> int
 
+// Raw byte accessors for the malloc'd receive/parse buffers — string
+// indexing is bounds-checked against strlen, which truncates at the
+// first NUL inside a binary HTTP body (audio payloads are full of them).
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
 const maxRespBytes = 67108864
 
 // Resp is a parsed HTTP response. Body is malloc'd — caller frees.
@@ -141,21 +147,21 @@ pub fn Post(url: string, contentType: string, headers: string, body: string, bod
     // Parse status line "HTTP/1.x NNN" and split at \r\n\r\n.
     status := 0
     i := 0
-    for i < total && buf[i] != 32 {
+    for i < total && Skink_mem_byte(buf, int64(i)) != 32 {
         i = i + 1
     }
     if i < total {
         j := i + 1
         st := 0
-        for j < total && buf[j] >= 48 && buf[j] <= 57 {
-            st = st * 10 + int(buf[j]) - 48
+        for j < total && Skink_mem_byte(buf, int64(j)) >= 48 && Skink_mem_byte(buf, int64(j)) <= 57 {
+            st = st * 10 + Skink_mem_byte(buf, int64(j)) - 48
             j = j + 1
         }
         status = st
     }
     hdrEnd := -1
     for k := 0; k + 3 < total; k = k + 1 {
-        if buf[k] == 13 && buf[k + 1] == 10 && buf[k + 2] == 13 && buf[k + 3] == 10 {
+        if Skink_mem_byte(buf, int64(k)) == 13 && Skink_mem_byte(buf, int64(k + 1)) == 10 && Skink_mem_byte(buf, int64(k + 2)) == 13 && Skink_mem_byte(buf, int64(k + 3)) == 10 {
             hdrEnd = k + 4
             break
         }
@@ -167,7 +173,7 @@ pub fn Post(url: string, contentType: string, headers: string, body: string, bod
     bodyLen2 := total - hdrEnd
     bdy := libc.malloc(bodyLen2 + 1)
     libc.memcpy(bdy, string(int64(buf) + int64(hdrEnd)), bodyLen2)
-    bdy[bodyLen2] = 0
+    Skink_mem_write_byte(bdy, int64(bodyLen2), 0)
     libc.free(buf)
     return Resp{Status: status, Body: bdy, BodyLen: bodyLen2}, errors.New("")
 }

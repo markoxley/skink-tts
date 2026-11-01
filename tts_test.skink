@@ -19,13 +19,19 @@ import "std/time"
 import "std/testing"
 import "std/errors"
 
+// Raw byte accessors for malloc'd fixture buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte
+// inside a binary buffer.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
 // fakeSpeak is a test vtable entry returning fixed bytes.
 fn fakeSpeak(p: *tts_iface.Provider, text: string, o: tts_iface.Opts) -> (string, int, errors.Error) {
     b := libc.malloc(4)
-    b[0] = 82
-    b[1] = 73
-    b[2] = 70
-    b[3] = 70
+    Skink_mem_write_byte(b, 0, 82)
+    Skink_mem_write_byte(b, 1, 73)
+    Skink_mem_write_byte(b, 2, 70)
+    Skink_mem_write_byte(b, 3, 70)
     return b, 4, errors.New("")
 }
 
@@ -36,7 +42,7 @@ pub fn TestProviderVtable() {
     bytes, n, err := p.Speak("hi", tts_iface.DefaultOpts())
     testing.AssertTrue(str.Len(err.message) == 0, "fake speak")
     testing.AssertEqualInt(n, 4, "fake len")
-    testing.AssertTrue(bytes[0] == 82 && bytes[3] == 70, "fake bytes")
+    testing.AssertTrue(Skink_mem_byte(bytes, 0) == 82 && Skink_mem_byte(bytes, 3) == 70, "fake bytes")
     libc.free(bytes)
 }
 
@@ -73,35 +79,35 @@ pub fn TestDetect() {
 // fakeWav builds a minimal valid WAV (44-byte header, 8 silent frames).
 fn fakeWav() -> (string, int) {
     b := libc.malloc(60)
-    b[0] = 82
-    b[1] = 73
-    b[2] = 70
-    b[3] = 70    // RIFF
-    b[4] = 52    // size
-    b[8] = 87    // WAVE
-    b[9] = 65
-    b[10] = 86
-    b[11] = 69
-    b[12] = 102  // fmt
-    b[13] = 109
-    b[14] = 116
-    b[15] = 32
-    b[16] = 16   // fmt size
-    b[20] = 1    // PCM
-    b[22] = 1    // mono
-    b[24] = 64   // rate lo
-    b[25] = 31   // 8000Hz
-    b[28] = 128  // byte rate lo
-    b[29] = 62
-    b[32] = 2    // block align
-    b[34] = 16   // bits
-    b[36] = 100  // data
-    b[37] = 97
-    b[38] = 116
-    b[39] = 97
-    b[40] = 16   // 16 bytes data
+    Skink_mem_write_byte(b, 0, 82)
+    Skink_mem_write_byte(b, 1, 73)
+    Skink_mem_write_byte(b, 2, 70)
+    Skink_mem_write_byte(b, 3, 70)    // RIFF
+    Skink_mem_write_byte(b, 4, 52)    // size
+    Skink_mem_write_byte(b, 8, 87)    // WAVE
+    Skink_mem_write_byte(b, 9, 65)
+    Skink_mem_write_byte(b, 10, 86)
+    Skink_mem_write_byte(b, 11, 69)
+    Skink_mem_write_byte(b, 12, 102)  // fmt
+    Skink_mem_write_byte(b, 13, 109)
+    Skink_mem_write_byte(b, 14, 116)
+    Skink_mem_write_byte(b, 15, 32)
+    Skink_mem_write_byte(b, 16, 16)   // fmt size
+    Skink_mem_write_byte(b, 20, 1)    // PCM
+    Skink_mem_write_byte(b, 22, 1)    // mono
+    Skink_mem_write_byte(b, 24, 64)   // rate lo
+    Skink_mem_write_byte(b, 25, 31)   // 8000Hz
+    Skink_mem_write_byte(b, 28, 128)  // byte rate lo
+    Skink_mem_write_byte(b, 29, 62)
+    Skink_mem_write_byte(b, 32, 2)    // block align
+    Skink_mem_write_byte(b, 34, 16)   // bits
+    Skink_mem_write_byte(b, 36, 100)  // data
+    Skink_mem_write_byte(b, 37, 97)
+    Skink_mem_write_byte(b, 38, 116)
+    Skink_mem_write_byte(b, 39, 97)
+    Skink_mem_write_byte(b, 40, 16)   // 16 bytes data
     for i := 44; i < 60; i = i + 1 {
-        b[i] = 0
+        Skink_mem_write_byte(b, int64(i), 0)
     }
     return b, 60
 }
@@ -142,7 +148,7 @@ pub fn TestRestProvider() {
     waitgroup.Wait(wg)
     testing.AssertTrue(str.Len(err.message) == 0, str.Concat("rest speak: ", err.message))
     testing.AssertEqualInt(n, 60, "wav len")
-    testing.AssertTrue(n >= 4 && bytes[0] == 82 && bytes[1] == 73, "wav magic")
+    testing.AssertTrue(n >= 4 && Skink_mem_byte(bytes, 0) == 82 && Skink_mem_byte(bytes, 1) == 73, "wav magic")
     libc.free(bytes)
 }
 
@@ -174,4 +180,62 @@ pub fn TestDetectEntry() {
 pub fn TestAvailableEscapes() {
     testing.AssertFalse(tts_proc.Available("x';id;'"), "shell chars escaped")
     testing.AssertFalse(tts_proc.Available("definitely-not-a-real-binary-xyz"), "missing binary")
+}
+
+// TestProcConstructors verifies every subprocess provider constructor
+// wires a named provider with a working speakFn (calling Speak would
+// invoke the real engine, so only construction is asserted here).
+pub fn TestProcConstructors() {
+    pe := tts_proc.Espeak()
+    testing.AssertTrue(str.Len(pe.Name) > 0, "Espeak name")
+    png := tts_proc.EspeakNG()
+    testing.AssertTrue(str.Len(png.Name) > 0, "EspeakNG name")
+    pp := tts_proc.Piper("/tmp/model.onnx")
+    testing.AssertTrue(str.Len(pp.Name) > 0, "Piper name")
+    ps := tts_proc.Say()
+    testing.AssertTrue(str.Len(ps.Name) > 0, "Say name")
+}
+
+// TestRestConstructors verifies the REST provider constructors produce
+// a "rest"-named provider.
+pub fn TestRestConstructors() {
+    po := tts_rest.OpenAI("k", "tts-1")
+    testing.AssertEqualString("rest", po.Name, "OpenAI name")
+    pb := tts_rest.WithBase("http://127.0.0.1:1", "k", "m")
+    testing.AssertEqualString("rest", pb.Name, "WithBase name")
+}
+
+// TestRootConstructors verifies the tts.* convenience constructors
+// delegate to the right providers.
+pub fn TestRootConstructors() {
+    po := tts.NewOpenAI("k", "tts-1")
+    testing.AssertEqualString("rest", po.Name, "NewOpenAI -> rest")
+    pe := tts.NewEspeak()
+    testing.AssertTrue(str.Len(pe.Name) > 0, "NewEspeak name")
+    pp := tts.NewPiper("/tmp/m.onnx")
+    testing.AssertTrue(str.Len(pp.Name) > 0, "NewPiper name")
+    ps := tts.NewSay()
+    testing.AssertTrue(str.Len(ps.Name) > 0, "NewSay name")
+}
+
+// TestDetectAPIKey verifies tts.Detect falls through to the OpenAI
+// provider when no offline engine is installed but an API key is set.
+pub fn TestDetectAPIKey() {
+    os.Setenv("TTS_API_KEY", "test-key-123")
+    p := tts.Detect()
+    if tts_proc.Available("espeak-ng") || tts_proc.Available("espeak") ||
+       tts_proc.Available("say") || tts_proc.Available("piper") {
+        testing.AssertNotEqualString("none", p.Name, "offline engine detected")
+    } else {
+        testing.AssertEqualString("rest", p.Name, "api key -> rest provider")
+    }
+    os.Unsetenv("TTS_API_KEY")
+}
+
+// TestRootSpeak verifies the tts.Speak convenience wrapper surfaces the
+// provider error as a plain string.
+pub fn TestRootSpeak() {
+    p := tts_iface.New("none")
+    _, _, e := tts.Speak(&p, "hi")
+    testing.AssertTrue(str.Len(e) > 0, "uninitialized provider errors")
 }

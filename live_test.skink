@@ -12,14 +12,19 @@ import "std/str"
 import "std/os"
 import "std/libc"
 
+// Raw byte read for the malloc'd audio buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte
+// inside binary data.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+
 fn checkMagic(data: string, n: int, name: string) -> int {
     if n < 12 {
         println("FAIL: ", name, " returned only ", n, " bytes")
         return 1
     }
-    riff := data[0] == 82 && data[1] == 73 && data[2] == 70 && data[3] == 70
-    form := data[0] == 70 && data[1] == 79 && data[2] == 82 && data[3] == 77
-    ogg := data[0] == 79 && data[1] == 103 && data[2] == 103 && data[3] == 83
+    riff := Skink_mem_byte(data, 0) == 82 && Skink_mem_byte(data, 1) == 73 && Skink_mem_byte(data, 2) == 70 && Skink_mem_byte(data, 3) == 70
+    form := Skink_mem_byte(data, 0) == 70 && Skink_mem_byte(data, 1) == 79 && Skink_mem_byte(data, 2) == 82 && Skink_mem_byte(data, 3) == 77
+    ogg := Skink_mem_byte(data, 0) == 79 && Skink_mem_byte(data, 1) == 103 && Skink_mem_byte(data, 2) == 103 && Skink_mem_byte(data, 3) == 83
     if !riff && !form && !ogg {
         println("FAIL: ", name, " returned unrecognized audio magic")
         return 1

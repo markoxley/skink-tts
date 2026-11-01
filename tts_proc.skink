@@ -16,6 +16,11 @@ import "tts_iface"
 
 extern fn getpid() -> int
 
+// Raw byte write for the malloc'd engine-output buffer — string indexing
+// is bounds-checked against strlen, which cannot address positions
+// inside binary data (audio files contain NUL bytes).
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
 // pcfg holds subprocess provider config behind Provider.State.
 struct pcfg {
     bin:   string   // executable name or absolute path
@@ -180,6 +185,6 @@ fn procSpeak(p: *tts_iface.Provider, text: string, o: tts_iface.Opts) -> (string
     }
     f.Close()
     fs.Remove(outPath)
-    data[got] = 0
+    Skink_mem_write_byte(data, int64(got), 0)
     return data, got, errors.New("")
 }
