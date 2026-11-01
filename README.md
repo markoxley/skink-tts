@@ -14,8 +14,8 @@ scales add markoxley/skink-tts
 ## Quick start
 
 ```skink
-import "tts"
-import "tts_iface"
+import "mod/markoxley/skink-tts"
+import "mod/markoxley/skink-tts/tts_iface"
 import "std/libc"
 
 // pick whatever's available: espeak-ng/espeak/say on PATH,
@@ -44,6 +44,8 @@ libc.free(bytes)
 ## Options
 
 ```skink
+import "mod/markoxley/skink-tts/tts_iface"
+
 o := tts_iface.DefaultOpts()
 o.Voice = "alloy"    // voice name (REST) or -v value (espeak)
 o.Speed = 1.25       // rate multiplier
@@ -56,6 +58,9 @@ o.Format = "wav"     // "mp3" also accepted by OpenAI-compatible APIs
 `State` to your own backend:
 
 ```skink
+import "mod/markoxley/skink-tts/tts_iface"
+import "std/errors"
+
 fn mySpeak(p: *tts_iface.Provider, text: string, o: tts_iface.Opts) -> (string, int, errors.Error) {
     // return malloc'd audio bytes + length
 }
